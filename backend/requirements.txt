@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy
+asyncpg        # use if Postgres
+aiomysql       # use if MySQL
+pydantic
+pandas
+scipy          # for Hungarian algorithm
+python-multipart  # for file uploads
