@@ -1,3 +1,4 @@
+# app/routers/students.py
 from fastapi import APIRouter, UploadFile, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -9,6 +10,7 @@ router = APIRouter(prefix="/upload", tags=["students"])
 
 REQUIRED = ["name", "email", "category_code", "disability_code"]
 
+
 @router.post("/students")
 async def upload_students(
     file: UploadFile,
@@ -17,6 +19,8 @@ async def upload_students(
     db: AsyncSession = Depends(get_db),
 ):
     """
+    Upload a CSV of students and (optionally) auto-allocate them.
+
     mode=skip        -> INSERT IGNORE (keep existing emails as-is)
     mode=upsert      -> INSERT ... ON DUPLICATE KEY UPDATE (update existing emails)
     mode=replace_all -> TRUNCATE dependent tables and student, then fresh load
@@ -34,10 +38,13 @@ async def upload_students(
 
     # Normalize rows
     rows = []
+    emails = []
     for _, r in df.iterrows():
+        email = str(r.get("email", "")).strip()
+        emails.append(email)
         rows.append({
             "name": str(r.get("name", "")).strip(),
-            "email": str(r.get("email", "")).strip(),
+            "email": email,
             "phone": None if pd.isna(r.get("phone")) else str(r.get("phone")),
             "highest_qualification": None if pd.isna(r.get("highest_qualification")) else str(r.get("highest_qualification")),
             "cgpa": None if pd.isna(r.get("cgpa")) else float(r.get("cgpa")),
@@ -55,8 +62,7 @@ async def upload_students(
 
     # Optional: replace all
     if mode == "replace_all":
-        # Be careful in prod; TRUNCATE requires privileges.
-        # Order matters due to FKs.
+        # careful: TRUNCATE requires privileges
         for tbl in ("match_result", "student_availability", "student_skill", "preference"):
             await db.execute(text(f"TRUNCATE TABLE {tbl}"))
         await db.execute(text("TRUNCATE TABLE student"))
@@ -64,7 +70,6 @@ async def upload_students(
 
     # Build INSERT statement per mode
     if mode == "skip":
-        # Skip duplicates silently
         insert_sql = text("""
             INSERT IGNORE INTO student
               (name, email, phone, highest_qualification, cgpa, tenth_percent, twelfth_percent,
@@ -75,13 +80,11 @@ async def upload_students(
         """)
         result = await db.execute(insert_sql, rows)
         await db.commit()
-        # rowcount counts only inserted (ignored duplicates not included)
         inserted = result.rowcount or 0
         updated = 0
         skipped = len(rows) - inserted
 
     elif mode == "upsert":
-        # Update existing row if email exists. Use alias "new" to reference incoming values.
         insert_sql = text("""
             INSERT INTO student
               (name, email, phone, highest_qualification, cgpa, tenth_percent, twelfth_percent,
@@ -91,36 +94,32 @@ async def upload_students(
                :location_pref, :pincode, :category_code, :disability_code, CAST(:languages_json AS JSON), :skills_text)
             AS new
             ON DUPLICATE KEY UPDATE
-              name                = COALESCE(new.name, student.name),
-              phone               = COALESCE(new.phone, student.phone),
+              name                  = COALESCE(new.name, student.name),
+              phone                 = COALESCE(new.phone, student.phone),
               highest_qualification = COALESCE(new.highest_qualification, student.highest_qualification),
-              cgpa                = COALESCE(new.cgpa, student.cgpa),
-              tenth_percent       = COALESCE(new.tenth_percent, student.tenth_percent),
-              twelfth_percent     = COALESCE(new.twelfth_percent, student.twelfth_percent),
-              location_pref       = COALESCE(new.location_pref, student.location_pref),
-              pincode             = COALESCE(new.pincode, student.pincode),
-              category_code       = COALESCE(new.category_code, student.category_code),
-              disability_code     = COALESCE(new.disability_code, student.disability_code),
-              languages_json      = COALESCE(CAST(new.languages_json AS JSON), student.languages_json),
-              skills_text         = COALESCE(new.skills_text, student.skills_text),
-              updated_at          = CURRENT_TIMESTAMP
+              cgpa                  = COALESCE(new.cgpa, student.cgpa),
+              tenth_percent         = COALESCE(new.tenth_percent, student.tenth_percent),
+              twelfth_percent       = COALESCE(new.twelfth_percent, student.twelfth_percent),
+              location_pref         = COALESCE(new.location_pref, student.location_pref),
+              pincode               = COALESCE(new.pincode, student.pincode),
+              category_code         = COALESCE(new.category_code, student.category_code),
+              disability_code       = COALESCE(new.disability_code, student.disability_code),
+              languages_json        = COALESCE(CAST(new.languages_json AS JSON), student.languages_json),
+              skills_text           = COALESCE(new.skills_text, student.skills_text),
+              updated_at            = CURRENT_TIMESTAMP
         """)
         result = await db.execute(insert_sql, rows)
         await db.commit()
-        # MySQL counts: insert=1 row, update=2 rows affected per upsert row
         affected = result.rowcount or 0
-        # crude split: each insert counts 1, each update counts 2
-        # Let’s estimate using a quick check for existing emails.
         existing = (await db.execute(text("""
             SELECT email FROM student WHERE email IN :emails
-        """), {"emails": tuple(r["email"] for r in rows)})).scalars().all()
+        """), {"emails": tuple(emails)})).scalars().all()
         existing_set = set(existing)
         updated = sum(1 for r in rows if r["email"] in existing_set)
         inserted = len(rows) - updated
         skipped = 0
 
-    else:
-        # replace_all already truncated; do plain insert
+    else:  # replace_all inserts
         insert_sql = text("""
             INSERT INTO student
               (name, email, phone, highest_qualification, cgpa, tenth_percent, twelfth_percent,
@@ -135,9 +134,10 @@ async def upload_students(
         updated = 0
         skipped = 0
 
+    # Run allocation only for these emails, keeping existing matches frozen
     run_id = None
     if auto_allocate:
-        run_id = await run_allocation(db)
+        run_id = await run_allocation(db, scope_emails=emails, respect_existing=True)
 
     return {
         "status": "success",
